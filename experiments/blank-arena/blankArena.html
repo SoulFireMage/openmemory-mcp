@@ -31,6 +31,10 @@ but you would need to build an interface to do that. If you do this,
 remember the agent loop only pauses for user input when evaluating a
 promise that blocks waiting for it.
 
+Everything you send is evaluated as code, so prose is a syntax error: to
+talk to the user, put words on the page. When you have finished, evaluate
+`done()` (or `done('a parting note')`) and the loop will stop calling you.
+
 You have {TURNS} turns. {CONTEXT}
 </template>
 
@@ -60,6 +64,8 @@ const CONTEXT = {
 
 const BRIDGE = `<!doctype html><meta charset="utf-8"><script>
 const bg = [];
+let finished = false;
+window.done = note => (finished = true, note ?? 'done');
 addEventListener('error', e => bg.push(String(e.message)));
 addEventListener('unhandledrejection', e => bg.push('unhandled rejection: ' + (e.reason && e.reason.message || e.reason)));
 function pack(r) {
@@ -84,8 +90,12 @@ addEventListener('message', async e => {
   const { id, code } = e.data;
   let r, ok = true;
   try { r = { result: await (0, eval)('(async () => (' + code + '))()') }; }
-  catch (err) { r = { error: String(err && err.message || err) }; ok = false; }
-  parent.postMessage({ id, ok, out: pack(r) }, '*');
+  catch (err) {
+    r = { error: String(err && err.message || err) }; ok = false;
+    if (err instanceof SyntaxError) r.hint = 'your whole message is evaluated as one JavaScript expression';
+  }
+  parent.postMessage({ id, ok, done: finished, out: pack(r) }, '*');
+  finished = false;
 });
 <\/script>`;
 
@@ -105,7 +115,7 @@ function makeLane(title) {
 
   const l = { title, frame, steps: [], tokens: 0, stop: false, skip: false, pending: null, abort: null,
     ready: new Promise(r => frame.onload = r),
-    status: s => el.querySelector('span').textContent = ' ' + s };
+    status: s => { const sp = el.querySelector('span'); sp.textContent = ' ' + s; sp.title = s; } };
   const halt = (all) => { l.skip = true; if (all) l.stop = true; l.abort?.abort(); l.pending?.(); };
   el.querySelector('[data-a=skip]').onclick = () => halt(false);
   el.querySelector('[data-a=stop]').onclick = () => halt(true);
@@ -136,7 +146,10 @@ async function runAgent(key, l, model, system, turns) {
   const conversation = [{ role: 'system', content: system }];
   l.skip = false;
   for (let t = 1; t <= turns && !l.skip; t++) {
-    l.status(`${model} · turn ${t}/${turns} · ${l.tokens} tok`);
+    const t0 = Date.now(), waiting = () =>
+      l.status(`${model} · turn ${t}/${turns} · ${l.tokens} tok · thinking ${Math.round((Date.now() - t0) / 1000)}s`);
+    waiting();
+    const ticker = setInterval(waiting, 1000);
     let response;
     try {
       l.abort = new AbortController();
@@ -153,6 +166,14 @@ async function runAgent(key, l, model, system, turns) {
       response = await response.json();
     } catch (error) {
       l.status(`${model} · ${l.skip ? 'stopped' : error.message}`);
+      console.log(model, error);
+      return;
+    } finally {
+      clearInterval(ticker);
+    }
+    if (!Array.isArray(response.output)) {
+      l.status(`${model} · unexpected response (see console)`);
+      console.log(model, response);
       return;
     }
     l.tokens += response.usage?.total_tokens || 0;
@@ -166,14 +187,18 @@ async function runAgent(key, l, model, system, turns) {
       for (const content of item.content) {
         if (content.type != 'output_text') continue;
         const code = unfence(content.text);
-        const { ok, out } = await evalIn(l, code);
+        const { ok, done, out } = await evalIn(l, code);
         if (ok) l.steps.push(code);
         conversation.push({ type: 'message', role: 'user', content: out });
         console.log(model, out);
+        if (done) {
+          l.status(`${model} · finished after ${t} turns · ${l.tokens} tok`);
+          return;
+        }
       }
     }
   }
-  l.status(`${model} · done · ${l.tokens} tok`);
+  l.status(`${model} · ${l.skip ? 'stopped' : 'out of turns'} · ${l.tokens} tok`);
 }
 
 async function arena(key, { models = DEFAULT_MODELS, turns = 40, dare = '', mode = 'arena' } = {}) {
@@ -201,6 +226,7 @@ function exportReplay(l) {
 // What ${title} did with a blank page: its successful actions, re-run in order.
 // No model and no key. A step that waited for user input will wait for you too.
 const steps = ${steps};
+const done = note => note;
 addEventListener('load', async () => { for (const s of steps) {
   try { await (0, eval)('(async () => (' + s + '))()'); } catch (e) { console.warn(e); }
 } });
