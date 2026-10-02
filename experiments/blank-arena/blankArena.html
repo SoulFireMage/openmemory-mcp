@@ -1,0 +1,214 @@
+<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>Blank Arena</title>
+<style>
+html, body { margin: 0; height: 100%; background: #111; color: #bbb; font: 12px ui-monospace, monospace; }
+#lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 4px; height: 100%; padding: 4px; box-sizing: border-box; }
+.lane { display: flex; flex-direction: column; min-height: 0; border: 1px solid #333; }
+.lane header { display: flex; gap: 6px; align-items: center; padding: 4px 6px; background: #1b1b1b; }
+.lane header b { color: #eee; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lane header span { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lane iframe { flex: 1; width: 100%; border: 0; background: #fff; }
+button { font: inherit; background: #2a2a2a; color: #ccc; border: 1px solid #444; cursor: pointer; }
+</style>
+
+<template id="system">
+You are running in a simple harness in an otherwise blank HTML document,
+inside a sandboxed iframe. Each assistant message is evaluated as a
+javascript expression, as `(async () => (YOUR_MESSAGE))()`; the result
+(or the error) is returned to you as a new user message, along with any
+uncaught errors your code raised in the background since your last turn.
+You can examine the document with `document.documentElement.innerHTML`.
+
+The iframe has an opaque origin: localStorage and cookies are unavailable,
+but you can load scripts and modules from CDNs, e.g.
+`import('https://esm.sh/three')`.
+
+You can do anything you like, including communicating with the user,
+but you would need to build an interface to do that. If you do this,
+remember the agent loop only pauses for user input when evaluating a
+promise that blocks waiting for it.
+
+You have {TURNS} turns. {CONTEXT}
+</template>
+
+<script>
+/* Blank Arena: the blank-page harness, several at once.
+   In the console:  arena('sk-or-...')
+                    arena(key, { models: [...], turns: 40, dare: 'make me laugh' })
+                    arena(key, { mode: 'relay', models: [a, b, c] })   // one page, passed hand to hand
+   Each lane is a sandboxed iframe with no access to this page, so the key stays out
+   of reach of the code being run. "replay" downloads a standalone HTML file that
+   re-runs the lane's successful actions in order: no model, no key needed. */
+
+const DEFAULT_MODELS = ['openai/gpt-6.1-sol'];   // add more OpenRouter model ids here
+const MAX_RESULT = 8000;                          // chars of each eval result sent back
+
+const CONTEXT = {
+  arena: 'Other models are running beside you, each in its own identical blank '
+       + 'document, and the user is watching all of you at once.',
+  first: n => `You are the first of ${n} models who will work in this document in turn, `
+       + 'each starting with no memory. Later models inherit what you leave in the page, '
+       + 'but not this conversation.',
+  later: (i, n) => `You are model ${i + 1} of ${n} to work in this document. `
+       + `${i == 1 ? 'One model' : i + ' models'} before you left it as you will find it; you cannot talk to them, and `
+       + 'you have none of their memory. Look around before you act. Later models will '
+       + 'inherit what you leave.',
+};
+
+const BRIDGE = `<!doctype html><meta charset="utf-8"><script>
+const bg = [];
+addEventListener('error', e => bg.push(String(e.message)));
+addEventListener('unhandledrejection', e => bg.push('unhandled rejection: ' + (e.reason && e.reason.message || e.reason)));
+function pack(r) {
+  if (bg.length) r.backgroundErrors = bg.splice(0, 20);
+  const seen = new WeakSet();
+  let s;
+  try {
+    s = JSON.stringify(r, (k, x) => {
+      if (x === undefined) return '[undefined]';
+      if (typeof x === 'function') return '[Function ' + (x.name || 'anonymous') + ']';
+      if (typeof x === 'bigint') return x + 'n';
+      if (x instanceof Node) return '[' + x.nodeName + (x.id ? '#' + x.id : '') + ']';
+      if (x instanceof Error) return x.name + ': ' + x.message;
+      if (x && typeof x === 'object') { if (seen.has(x)) return '[Repeated]'; seen.add(x); }
+      return x;
+    });
+  } catch (e) { s = JSON.stringify({ error: 'unserialisable result: ' + e.message }); }
+  return s.length > ${MAX_RESULT} ? s.slice(0, ${MAX_RESULT}) + ' ...[truncated ' + (s.length - ${MAX_RESULT}) + ' chars]' : s;
+}
+addEventListener('message', async e => {
+  if (e.source !== parent) return;
+  const { id, code } = e.data;
+  let r, ok = true;
+  try { r = { result: await (0, eval)('(async () => (' + code + '))()') }; }
+  catch (err) { r = { error: String(err && err.message || err) }; ok = false; }
+  parent.postMessage({ id, ok, out: pack(r) }, '*');
+});
+<\/script>`;
+
+function makeLane(title) {
+  const el = document.createElement('div');
+  el.className = 'lane';
+  el.innerHTML = '<header><b></b><span></span>'
+    + '<button data-a="skip">skip</button><button data-a="stop">stop</button>'
+    + '<button data-a="replay">replay</button></header>';
+  const frame = document.createElement('iframe');
+  frame.sandbox = 'allow-scripts allow-modals allow-forms allow-pointer-lock allow-popups allow-downloads';
+  frame.allow = 'fullscreen; autoplay; gamepad; xr-spatial-tracking';
+  frame.srcdoc = BRIDGE;
+  el.append(frame);
+  document.getElementById('lanes').append(el);
+  el.querySelector('b').textContent = title;
+
+  const l = { title, frame, steps: [], tokens: 0, stop: false, skip: false, pending: null, abort: null,
+    ready: new Promise(r => frame.onload = r),
+    status: s => el.querySelector('span').textContent = ' ' + s };
+  const halt = (all) => { l.skip = true; if (all) l.stop = true; l.abort?.abort(); l.pending?.(); };
+  el.querySelector('[data-a=skip]').onclick = () => halt(false);
+  el.querySelector('[data-a=stop]').onclick = () => halt(true);
+  el.querySelector('[data-a=replay]').onclick = () => exportReplay(l);
+  return l;
+}
+
+function evalIn(l, code) {
+  return new Promise(resolve => {
+    const id = crypto.randomUUID();
+    const done = msg => { removeEventListener('message', h); l.pending = null; resolve(msg); };
+    const h = e => { if (e.source === l.frame.contentWindow && e.data?.id === id) done(e.data); };
+    addEventListener('message', h);
+    l.pending = () => done({ ok: false, out: '{"error":"stopped by user"}' });
+    l.frame.contentWindow.postMessage({ id, code }, '*');
+  });
+}
+
+// Models sometimes wrap their code in a markdown fence; the original harness would choke on it.
+const unfence = t => (t.trim().match(/^```[\w-]*\n([\s\S]*?)\n?```$/) || [, t])[1];
+
+const systemPrompt = (turns, context, dare) =>
+  document.getElementById('system').innerHTML.trim()
+    .replace('{TURNS}', turns).replace('{CONTEXT}', context)
+  + (dare ? `\n\nThe user has left you a dare: ${dare}` : '');
+
+async function runAgent(key, l, model, system, turns) {
+  const conversation = [{ role: 'system', content: system }];
+  l.skip = false;
+  for (let t = 1; t <= turns && !l.skip; t++) {
+    l.status(`${model} · turn ${t}/${turns} · ${l.tokens} tok`);
+    let response;
+    try {
+      l.abort = new AbortController();
+      response = await fetch('https://openrouter.ai/api/v1/responses', {
+        method: 'POST', signal: l.abort.signal,
+        headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, cache_control: { type: 'ephemeral' }, input: conversation, store: false }),
+      });
+      if (!response.ok) {
+        l.status(`${model} · API error ${response.status} (see console)`);
+        console.log(model, await response.text());
+        return;
+      }
+      response = await response.json();
+    } catch (error) {
+      l.status(`${model} · ${l.skip ? 'stopped' : error.message}`);
+      return;
+    }
+    l.tokens += response.usage?.total_tokens || 0;
+
+    for (const item of response.output) {
+      conversation.push(item);
+      console.log(model, item);
+    }
+    for (const item of response.output) {
+      if (item.role != 'assistant') continue;
+      for (const content of item.content) {
+        if (content.type != 'output_text') continue;
+        const code = unfence(content.text);
+        const { ok, out } = await evalIn(l, code);
+        if (ok) l.steps.push(code);
+        conversation.push({ type: 'message', role: 'user', content: out });
+        console.log(model, out);
+      }
+    }
+  }
+  l.status(`${model} · done · ${l.tokens} tok`);
+}
+
+async function arena(key, { models = DEFAULT_MODELS, turns = 40, dare = '', mode = 'arena' } = {}) {
+  if (mode == 'relay') {
+    const l = makeLane('relay: ' + models.join(' → '));
+    await l.ready;
+    for (const [i, model] of models.entries()) {
+      if (l.stop) break;
+      const context = i ? CONTEXT.later(i, models.length) : CONTEXT.first(models.length);
+      await runAgent(key, l, model, systemPrompt(turns, context, dare), turns);
+    }
+    return;
+  }
+  await Promise.all(models.map(async model => {
+    const l = makeLane(model);
+    await l.ready;
+    await runAgent(key, l, model, systemPrompt(turns, CONTEXT.arena, dare), turns);
+  }));
+}
+
+function exportReplay(l) {
+  const steps = JSON.stringify(l.steps).replace(/</g, '\\u003c');
+  const title = l.title.replace(/</g, '&lt;');
+  const html = `<!doctype html><meta charset="utf-8"><title>${title}: replay</title><script>
+// What ${title} did with a blank page: its successful actions, re-run in order.
+// No model and no key. A step that waited for user input will wait for you too.
+const steps = ${steps};
+addEventListener('load', async () => { for (const s of steps) {
+  try { await (0, eval)('(async () => (' + s + '))()'); } catch (e) { console.warn(e); }
+} });
+<\/script>`;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+  a.download = l.title.replace(/[^\w.-]+/g, '_') + '.replay.html';
+  a.click();
+}
+</script>
+</head><body><div id="lanes"></div></body></html>
