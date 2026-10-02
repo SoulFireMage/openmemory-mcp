@@ -1,16 +1,24 @@
 <!doctype html>
 <html><head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Blank Arena</title>
 <style>
 html, body { margin: 0; height: 100%; background: #111; color: #bbb; font: 12px ui-monospace, monospace; }
 #lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
   gap: 4px; height: 100%; padding: 4px; box-sizing: border-box; }
+@media (max-width: 760px) { #lanes { height: auto; grid-auto-rows: 75vh; } }
 .lane { display: flex; flex-direction: column; min-height: 0; border: 1px solid #333; }
 .lane header { display: flex; gap: 6px; align-items: center; padding: 4px 6px; background: #1b1b1b; }
 .lane header b { color: #eee; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lane header span { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lane iframe { flex: 1; width: 100%; border: 0; background: #fff; }
+#start { max-width: 520px; margin: 10vh auto; padding: 0 16px; display: grid; gap: 10px; }
+#start h1 { margin: 0; color: #eee; font-size: 18px; }
+#start p { margin: 0; line-height: 1.5; }
+#start input, #start select { font: inherit; font-size: 16px; padding: 8px; background: #1b1b1b;
+  color: #eee; border: 1px solid #444; width: 100%; box-sizing: border-box; }
+#start button { font-size: 16px; padding: 10px; }
 button { font: inherit; background: #2a2a2a; color: #ccc; border: 1px solid #444; cursor: pointer; }
 </style>
 
@@ -147,7 +155,7 @@ async function runAgent(key, l, model, system, turns) {
   l.skip = false;
   for (let t = 1; t <= turns && !l.skip; t++) {
     const t0 = Date.now(), waiting = () =>
-      l.status(`${model} · turn ${t}/${turns} · ${l.tokens} tok · thinking ${Math.round((Date.now() - t0) / 1000)}s`);
+      l.status(`turn ${t}/${turns} · ${l.tokens} tok · thinking ${Math.round((Date.now() - t0) / 1000)}s`);
     waiting();
     const ticker = setInterval(waiting, 1000);
     let response;
@@ -159,20 +167,20 @@ async function runAgent(key, l, model, system, turns) {
         body: JSON.stringify({ model, cache_control: { type: 'ephemeral' }, input: conversation, store: false }),
       });
       if (!response.ok) {
-        l.status(`${model} · API error ${response.status} (see console)`);
+        l.status(`API error ${response.status} (see console)`);
         console.log(model, await response.text());
         return;
       }
       response = await response.json();
     } catch (error) {
-      l.status(`${model} · ${l.skip ? 'stopped' : error.message}`);
+      l.status(`${l.skip ? 'stopped' : error.message}`);
       console.log(model, error);
       return;
     } finally {
       clearInterval(ticker);
     }
     if (!Array.isArray(response.output)) {
-      l.status(`${model} · unexpected response (see console)`);
+      l.status(`unexpected response (see console)`);
       console.log(model, response);
       return;
     }
@@ -192,13 +200,13 @@ async function runAgent(key, l, model, system, turns) {
         conversation.push({ type: 'message', role: 'user', content: out });
         console.log(model, out);
         if (done) {
-          l.status(`${model} · finished after ${t} turns · ${l.tokens} tok`);
+          l.status(`finished after ${t} turns · ${l.tokens} tok`);
           return;
         }
       }
     }
   }
-  l.status(`${model} · ${l.skip ? 'stopped' : 'out of turns'} · ${l.tokens} tok`);
+  l.status(`${l.skip ? 'stopped' : 'out of turns'} · ${l.tokens} tok`);
 }
 
 async function arena(key, { models = DEFAULT_MODELS, turns = 40, dare = '', mode = 'arena' } = {}) {
@@ -237,4 +245,29 @@ addEventListener('load', async () => { for (const s of steps) {
   a.click();
 }
 </script>
-</head><body><div id="lanes"></div></body></html>
+</head><body>
+<form id="start">
+  <h1>Blank Arena</h1>
+  <p>Give some models an empty web page and see what they do with it.
+     Your OpenRouter key stays in this tab and is only sent to OpenRouter.</p>
+  <input name="key" type="password" placeholder="OpenRouter key (sk-or-...)" required autocomplete="off">
+  <input name="models" placeholder="models, comma separated">
+  <input name="dare" placeholder="a dare (optional)">
+  <select name="mode"><option value="arena">side by side</option><option value="relay">relay: one page, passed hand to hand</option></select>
+  <input name="turns" type="number" min="1" max="200" value="40">
+  <button>start</button>
+</form>
+<div id="lanes"></div>
+<script>
+const form = document.getElementById('start');
+form.models.value = DEFAULT_MODELS.join(', ');
+form.onsubmit = e => {
+  e.preventDefault();
+  const models = form.models.value.split(',').map(m => m.trim()).filter(Boolean);
+  form.remove();
+  arena(form.key.value.trim(), { models, dare: form.dare.value.trim(), mode: form.mode.value, turns: +form.turns.value || 40 });
+};
+const _arena = arena;
+arena = (...a) => { form.remove(); return _arena(...a); };   // console use still works
+</script>
+</body></html>
